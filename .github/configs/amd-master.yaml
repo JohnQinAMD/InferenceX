@@ -1231,3 +1231,53 @@ dsr1-fp4-mi355x-sglang-disagg-mtp:
         - "DECODE_NODES=1"
         - "DECODE_MTP_SIZE=1"
 
+# ---------------------------------------------------------------------------
+# Dynamo + SGLang on AMD MI355X
+# Aggregated mode with KV-cache-aware routing and MoRI RDMA disaggregated
+# Performance baselines: 17.3 req/s agg, 7.4 req/s disagg DSV3
+# ---------------------------------------------------------------------------
+
+dsr1-fp8-mi355x-dynamo-sglang:
+  image: rocm/sgl-dev:sglang-0.5.9-rocm720-mi35x-mori-0227-2
+  model: deepseek-ai/DeepSeek-R1-0528
+  model-prefix: dsr1
+  runner: mi355x
+  precision: fp8
+  framework: dynamo-sglang
+  multinode: false
+  seq-len-configs:
+  - isl: 1024
+    osl: 1024
+    search-space:
+    - tp: 8
+      conc-start: 4
+      conc-end: 32
+
+dsr1-fp8-mi355x-dynamo-sglang-disagg:
+  image: rocm/sgl-dev:sglang-0.5.9-rocm720-mi35x-mori-0227-2
+  model: deepseek-ai/DeepSeek-R1-0528
+  model-prefix: dsr1
+  runner: mi355x-disagg
+  precision: fp8
+  framework: dynamo-sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+  - isl: 1024
+    osl: 1024
+    search-space:
+    - conc-list: [1, 2, 4, 8]
+      prefill:
+        num-worker: 1
+        tp: 8
+        ep: 1
+        dp-attn: false
+        additional-settings:
+        - "DISAGG_TRANSFER_BACKEND=mori"
+      decode:
+        num-worker: 1
+        tp: 8
+        ep: 1
+        dp-attn: false
+        additional-settings:
+        - "DISAGG_TRANSFER_BACKEND=mori"
