@@ -1220,3 +1220,15 @@
     - "Uses nvidia/GLM-5-NVFP4 model with modelopt_fp4 quantization"
     - "Image: lmsysorg/sglang:nightly-dev-cu13-20260328-a27651d5"
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/973
+
+- config-keys:
+    - dsr1-fp8-mi355x-dynamo-sglang
+    - dsr1-fp8-mi355x-dynamo-sglang-disagg
+  description:
+    - "Add NVIDIA Dynamo + SGLang on AMD MI355X benchmark configurations"
+    - "Aggregated: single-node TP8, KV-cache-aware routing, concurrency 4-64, 1k1k + 8k1k"
+    - "Disaggregated: multi-node MoRI RDMA, 1P1D + 1P2D (1k1k), 1P1D + 2P1D (8k1k)"
+    - "Image: rocm/sgl-dev:sglang-0.5.9-rocm720-mi35x-mori-0227-2"
+    - "Performance baselines: 17.3 req/s agg peak, 7.4 req/s disagg DSV3 via MoRI RDMA"
+    - "Fix launch_mi355x-amds.sh to route dynamo-sglang framework to multi_node benchmark scripts"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/XXX

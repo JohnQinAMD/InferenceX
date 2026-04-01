@@ -52,7 +52,7 @@ if [[ "$IS_MULTINODE" == "true" ]]; then
     sudo rm -rf "$BENCHMARK_LOGS_DIR/logs" 2>/dev/null || true
 
     SCRIPT_NAME="${EXP_NAME%%_*}_${PRECISION}_mi355x_${FRAMEWORK}.sh"
-    if [[ "$FRAMEWORK" == "sglang-disagg" ]]; then
+    if [[ "$FRAMEWORK" == "sglang-disagg" || "$FRAMEWORK" == "dynamo-sglang" ]]; then
         BENCHMARK_SUBDIR="multi_node"
     else
         BENCHMARK_SUBDIR="single_node"
@@ -151,7 +151,13 @@ else
     export HF_HUB_CACHE_MOUNT="/var/lib/hf-hub-cache/"
     export PORT_OFFSET=${RUNNER_NAME: -1}
     export PORT=$(( 8888 + ${PORT_OFFSET} ))
-    FRAMEWORK_SUFFIX=$([[ "$FRAMEWORK" == "atom" ]] && printf '_atom' || printf '')
+    if [[ "$FRAMEWORK" == "atom" ]]; then
+        FRAMEWORK_SUFFIX='_atom'
+    elif [[ "$FRAMEWORK" == "dynamo-sglang" ]]; then
+        FRAMEWORK_SUFFIX='_dynamo-sglang'
+    else
+        FRAMEWORK_SUFFIX=''
+    fi
     SPEC_SUFFIX=$([[ "$SPEC_DECODING" == "mtp" ]] && printf '_mtp' || printf '')
 
     PARTITION="compute"
