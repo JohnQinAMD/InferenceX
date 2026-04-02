@@ -11,10 +11,63 @@
 set -x
 export PYTHONDONTWRITEBYTECODE=1
 
+# Pre-flight: warn if GPU VRAM has residual usage (stale containers hold memory)
+_vram=$(amd-smi monitor --gpu 0 2>/dev/null | awk 'NR==2{print $NF}' | cut -d/ -f1 || true)
+if [[ -n "$_vram" ]] && (( $(echo "$_vram > 0" | bc -l 2>/dev/null || echo 0) )); then
+    echo "[WARN] GPU 0 has ${_vram} GB VRAM in use. Stale containers may cause OOM."
+    echo "       Run 'docker rm -f \$(docker ps -aq)' to clean before benchmarking."
+fi
+
+# =============================================================================
+# Ionic RDMA initialization (only runs on Pensando ionic NIC clusters)
+# Handles: ABI fix, IPv4 assignment — required for MoRI RDMA on ionic hardware.
+# Clusters using rdma/mlx5 devices skip this entirely.
+# =============================================================================
+if ls /sys/class/infiniband/ionic_0 &>/dev/null; then
+    # --- Step 1: Fix libionic ABI mismatch ---
+    # Container libionic rarely matches the host kernel module version.
+    # job.slurm bind-mounts /usr/lib/x86_64-linux-gnu to /host_libs:ro
+    _abi_warn=$(ibv_devinfo 2>&1 | grep -c "does not support the kernel ABI" || true)
+    if [[ "$_abi_warn" -gt 0 ]]; then
+        _host_lib=$(ls /host_libs/libionic.so.1.1.* 2>/dev/null | head -1)
+        if [[ -n "$_host_lib" ]]; then
+            cp "$_host_lib" /usr/lib/x86_64-linux-gnu/libionic.so.1
+            ldconfig 2>/dev/null || true
+            _devs=$(ibv_devinfo 2>/dev/null | grep -c "hca_id" || true)
+            echo "[INFO] Ionic ABI fixed: copied $(basename "$_host_lib") → $_devs devices visible"
+        else
+            echo "[ERROR] Ionic ABI mismatch but no host libionic found at /host_libs/"
+            echo "        Ensure job.slurm has: -v /usr/lib/x86_64-linux-gnu:/host_libs:ro"
+        fi
+    else
+        echo "[INFO] Ionic ABI OK: $(ibv_devinfo 2>/dev/null | grep -c 'hca_id' || echo 0) devices"
+    fi
+
+    # --- Step 2: Assign IPv4 to ionic ports (required for RoCE v2 GIDs) ---
+    # Without IPv4, ibv_modify_qp fails with EINVAL during QP INIT→RTR.
+    _node_id=$(hostname | grep -oE '[0-9]+$' | tail -1 || true)
+    _node_id=$((10#${_node_id: -2}))
+    [[ "$_node_id" -eq 0 ]] && _node_id=100
+    for _i in 0 1 2 3 4 5 6 7; do
+        _iface=$(ls /sys/class/infiniband/ionic_$_i/device/net/ 2>/dev/null | head -1)
+        [[ -z "$_iface" ]] && continue
+        _gid_hex=$(cat /sys/class/infiniband/ionic_$_i/ports/1/gids/1 2>/dev/null | cut -d: -f4)
+        [[ -z "$_gid_hex" ]] && continue
+        _subnet=$((16#${_gid_hex: -2} + 100))
+        [[ $_subnet -gt 254 ]] && _subnet=$((_subnet - 100))
+        _existing=$(ip -4 addr show "$_iface" 2>/dev/null | grep "192.168.${_subnet}\." || true)
+        if [[ -z "$_existing" ]]; then
+            ip addr add "192.168.${_subnet}.${_node_id}/24" dev "$_iface" 2>/dev/null || true
+            ip link set "$_iface" up 2>/dev/null || true
+        fi
+    done
+    echo "[INFO] Ionic IPv4 configured (node_id=$_node_id)"
+fi
+
 # IBDEVICES configuration
 # Prefer IBDEVICES set by runner (runners/launch_mi355x-amds.sh)
 # Fall back to hostname detection if not set (for direct script execution)
-if [[ -z "$IBDEVICES" ]]; then
+if [[ -z "${IBDEVICES:-}" ]]; then
     NODENAME=$(hostname -s)
     if [[ $NODENAME == GPU* ]] || [[ $NODENAME == smci355-ccs-aus* ]]; then
         export IBDEVICES=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
@@ -77,7 +130,7 @@ export SGLANG_ROUTER_STDOUT_LOGS="${SGLANG_ROUTER_STDOUT_LOGS:-0}"
 
 # QoS/DSCP configuration
 # Priority order: 1) Set by runner, 2) Detect via nicctl, 3) Detect from hostname
-if [[ -n "$MORI_RDMA_TC" ]]; then
+if [[ -n "${MORI_RDMA_TC:-}" ]]; then
     echo "[INFO] Using MORI_RDMA_TC=$MORI_RDMA_TC (set by runner or environment)"
 elif command -v nicctl &> /dev/null; then
     ND_PRIO=$(nicctl show qos  2>/dev/null | awk '/PFC no-drop priorities/ {print $NF; exit}')

@@ -51,7 +51,7 @@ host_name=$(hostname)
 # MORI_RDMA_TC configuration (optional)
 # If set by runner, use it for RDMA traffic class configuration
 # If not set, RDMA operations will proceed without QoS/traffic class settings
-if [[ -n "${MORI_RDMA_TC}" ]]; then
+if [[ -n "${MORI_RDMA_TC:-}" ]]; then
     echo "[INFO] Using MORI_RDMA_TC=$MORI_RDMA_TC for RDMA traffic class configuration"
     echo "[INFO] Host '$host_name' configured with MORI_RDMA_TC=$MORI_RDMA_TC"
 else
@@ -366,8 +366,31 @@ if [ "$NODE_RANK" -eq 0 ]; then
     echo "Decode env: SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_MAX_DISPATCH_TOKENS_DECODE}"
     echo "================================================"
 
+    # Determine server command based on frontend type
+    FRONTEND_TYPE="${FRONTEND_TYPE:-sglang}"
+    if [[ "$FRONTEND_TYPE" == "dynamo" ]]; then
+        SGLANG_CMD="python3 -m dynamo.sglang"
+        BENCH_PORT=9000
+        echo "Frontend: Dynamo (etcd + nats + dynamo.frontend)"
+        # Start Dynamo infrastructure
+        MY_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {print $7}')
+        rm -rf /tmp/default.etcd
+        etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://${MY_IP}:2379 > /run_logs/slurm_job-${SLURM_JOB_ID}/etcd.log 2>&1 &
+        nats-server -p 4222 -js --client_advertise ${MY_IP}:4222 > /run_logs/slurm_job-${SLURM_JOB_ID}/nats.log 2>&1 &
+        sleep 3
+        export ETCD_ENDPOINTS=http://${MY_IP}:2379 NATS_SERVER=nats://${MY_IP}:4222
+        python3 -m dynamo.frontend --http-port ${BENCH_PORT} --router-mode round-robin --request-plane tcp \
+            > /run_logs/slurm_job-${SLURM_JOB_ID}/frontend_${host_name}.log 2>&1 &
+        frontend_pid=$!
+        sleep 2
+    else
+        SGLANG_CMD="python3 -m sglang.launch_server"
+        BENCH_PORT=30000
+        echo "Frontend: sglang_router"
+    fi
+
     # start the head prefill server
-    PREFILL_CMD="SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_MAX_DISPATCH_TOKENS_PREFILL} python3 -m sglang.launch_server \
+    PREFILL_CMD="SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_MAX_DISPATCH_TOKENS_PREFILL} ${SGLANG_CMD} \
         --model-path $MODEL_DIR/$MODEL_NAME \
         --disaggregation-mode prefill \
         --disaggregation-ib-device ${IBDEVICES} \
@@ -409,35 +432,14 @@ if [ "$NODE_RANK" -eq 0 ]; then
     fi
     echo "Congratulations!!! All prefill and decode servers are up . . ."
 
-    ROUTER_CMD="python -m sglang_router.launch_router \
-        --pd-disaggregation \
-        --port 30000 \
-        --policy random \
-        --prefill-policy random \
-        --decode-policy random \
-        ${PREFILL_ARGS} \
-        ${DECODE_ARGS}"
-
-
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-        echo "DRY RUN: $ROUTER_CMD"
-    else
-        ROUTER_LOG_FILE="/tmp/slurm_job-${SLURM_JOB_ID}_proxy_${host_name}.log"
-        set -x
-        if [[ "${SGLANG_ROUTER_STDOUT_LOGS:-0}" == "1" ]]; then
-            eval "$ROUTER_CMD" 2>&1 | tee "$ROUTER_LOG_FILE" &
-        else
-            eval "$ROUTER_CMD" >"$ROUTER_LOG_FILE" 2>&1 &
-        fi
-        set +x
-        proxy_pid=$!
-
-        # Wait for router to be ready via health endpoint
+    if [[ "$FRONTEND_TYPE" == "dynamo" ]]; then
+        # Dynamo frontend is already running (started above).
+        # Wait for it to discover all workers.
         HEALTH_BARRIER_CMD="python3 $SGLANG_WS_PATH/sync.py barrier \
             --node-ips ${NODE0_ADDR} \
-            --node-ports 30000 \
+            --node-ports ${BENCH_PORT} \
             --wait-for-all-health \
-            --health-endpoint /readiness \
+            --health-endpoint /health \
             --timeout 1800"
 
         if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -445,12 +447,52 @@ if [ "$NODE_RANK" -eq 0 ]; then
         else
             eval "$HEALTH_BARRIER_CMD"
         fi
+        proxy_pid=$frontend_pid
+        echo "Dynamo frontend is ready for benchmarking on port ${BENCH_PORT}"
+    else
+        # sglang_router path (original)
+        ROUTER_CMD="python -m sglang_router.launch_router \
+            --pd-disaggregation \
+            --port 30000 \
+            --policy random \
+            --prefill-policy random \
+            --decode-policy random \
+            ${PREFILL_ARGS} \
+            ${DECODE_ARGS}"
 
-        echo "Router is ready for benchmarking"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            echo "DRY RUN: $ROUTER_CMD"
+        else
+            ROUTER_LOG_FILE="/tmp/slurm_job-${SLURM_JOB_ID}_proxy_${host_name}.log"
+            set -x
+            if [[ "${SGLANG_ROUTER_STDOUT_LOGS:-0}" == "1" ]]; then
+                eval "$ROUTER_CMD" 2>&1 | tee "$ROUTER_LOG_FILE" &
+            else
+                eval "$ROUTER_CMD" >"$ROUTER_LOG_FILE" 2>&1 &
+            fi
+            set +x
+            proxy_pid=$!
+
+            HEALTH_BARRIER_CMD="python3 $SGLANG_WS_PATH/sync.py barrier \
+                --node-ips ${NODE0_ADDR} \
+                --node-ports 30000 \
+                --wait-for-all-health \
+                --health-endpoint /readiness \
+                --timeout 1800"
+
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                echo "DRY RUN: $HEALTH_BARRIER_CMD"
+            else
+                eval "$HEALTH_BARRIER_CMD"
+            fi
+
+            echo "Router is ready for benchmarking on port 30000"
+        fi
     fi
 
 
-    echo "Ready for benchmarking on ${host_name}:${host_ip}"
+    export BENCH_PORT
+    echo "Ready for benchmarking on ${host_name}:${host_ip} (port ${BENCH_PORT})"
 
     echo "Benchmarking on ${host_name}:${host_ip}"
     cd $SGLANG_WS_PATH
@@ -497,7 +539,16 @@ elif [ "$NODE_RANK" -gt 0 ] && [ "$NODE_RANK" -lt "$NODE_OFFSET" ]; then
     echo "Using prefill config: $PREFILL_SERVER_CONFIG"
     echo "Prefill parallelism: TP=${PREFILL_TP_SIZE}, EP enabled: ${PREFILL_ENABLE_EP}, DP enabled: ${PREFILL_ENABLE_DP}"
 
-    PREFILL_CMD="SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_MAX_DISPATCH_TOKENS_PREFILL} python3 -m sglang.launch_server \
+    FRONTEND_TYPE="${FRONTEND_TYPE:-sglang}"
+    if [[ "$FRONTEND_TYPE" == "dynamo" ]]; then
+        SGLANG_CMD="python3 -m dynamo.sglang"
+        HEAD_IP="${IP_ARRAY[0]}"
+        export ETCD_ENDPOINTS=http://${HEAD_IP}:2379 NATS_SERVER=nats://${HEAD_IP}:4222
+    else
+        SGLANG_CMD="python3 -m sglang.launch_server"
+    fi
+
+    PREFILL_CMD="SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_MAX_DISPATCH_TOKENS_PREFILL} ${SGLANG_CMD} \
         --model-path $MODEL_DIR/${MODEL_NAME} \
         --disaggregation-mode prefill \
         --disaggregation-ib-device ${IBDEVICES} \
@@ -560,7 +611,16 @@ else
     echo "Decode node rank: $RANK"
     echo "Decode parallelism: TP=${DECODE_TP_SIZE}, EP enabled: ${DECODE_ENABLE_EP}, DP enabled: ${DECODE_ENABLE_DP}"
 
-    DECODE_CMD="SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_MAX_DISPATCH_TOKENS_DECODE} python3 -m sglang.launch_server \
+    FRONTEND_TYPE="${FRONTEND_TYPE:-sglang}"
+    if [[ "$FRONTEND_TYPE" == "dynamo" ]]; then
+        SGLANG_CMD="python3 -m dynamo.sglang"
+        HEAD_IP="${IP_ARRAY[0]}"
+        export ETCD_ENDPOINTS=http://${HEAD_IP}:2379 NATS_SERVER=nats://${HEAD_IP}:4222
+    else
+        SGLANG_CMD="python3 -m sglang.launch_server"
+    fi
+
+    DECODE_CMD="SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${MORI_MAX_DISPATCH_TOKENS_DECODE} ${SGLANG_CMD} \
         --model-path ${MODEL_DIR}/${MODEL_NAME} \
         --disaggregation-mode decode \
         --disaggregation-ib-device ${IBDEVICES} \

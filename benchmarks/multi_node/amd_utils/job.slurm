@@ -358,6 +358,7 @@ exec sudo docker run --rm \
     -v ${MODEL_DIR}:/models \
     -v \$HOME/.ssh:/root/.ssh \
     -v $(which nicctl):/usr/sbin/nicctl \
+    -v /usr/lib/x86_64-linux-gnu:/host_libs:ro \
     --shm-size 128G \
     -v /tmp:/run_logs \
     -v ${BENCHMARK_LOGS_DIR}:/benchmark_logs \
@@ -389,6 +390,9 @@ exec sudo docker run --rm \
     -e TQDM_MININTERVAL=\$TQDM_MININTERVAL \
     -e DRY_RUN=\$DRY_RUN \
     -e BENCHMARK_LOGS_DIR=/benchmark_logs \
+    -e IBDEVICES=\${IBDEVICES:-} \
+    -e MORI_RDMA_TC=\${MORI_RDMA_TC:-} \
+    -e FRONTEND_TYPE=\${FRONTEND_TYPE:-sglang} \
     --name \"$DOCKER_CONT_NAME\" \
     \"$DOCKER_IMAGE_NAME\" bash -lc '
         mkdir -p /run_logs/slurm_job-'\"\$SLURM_JOB_ID\"'
