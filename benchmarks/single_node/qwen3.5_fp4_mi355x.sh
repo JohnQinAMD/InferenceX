@@ -5,11 +5,9 @@ source "$(dirname "$0")/../benchmark_lib.sh"
 check_env_vars \
     MODEL \
     TP \
-    EP_SIZE \
     CONC \
     ISL \
     OSL \
-    MAX_MODEL_LEN \
     RANDOM_RANGE_RATIO \
     RESULT_FILENAME
 
@@ -19,47 +17,34 @@ fi
 
 hf download "$MODEL"
 
-# Set HIP_VISIBLE_DEVICES to match ROCR_VISIBLE_DEVICES for Ray compatibility in vLLM 0.14+
-if [ -n "$ROCR_VISIBLE_DEVICES" ]; then
-    export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"
-fi
-
-export VLLM_ROCM_USE_AITER=1
-export VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+export SGLANG_USE_AITER=1
 
 SERVER_LOG=/workspace/server.log
 PORT=${PORT:-8888}
+MEM_FRAC_STATIC=${MEM_FRAC_STATIC:-0.8}
 
 if [ "${EVAL_ONLY}" = "true" ]; then
     setup_eval_context
-    MAX_MODEL_LEN="$EVAL_MAX_MODEL_LEN"
-fi
-
-if [ "$EP_SIZE" -gt 1 ]; then
-  EP=" --enable-expert-parallel"
-else
-  EP=" "
 fi
 
 # Start GPU monitoring (power, temperature, clocks every second)
 start_gpu_monitor
 
 set -x
-vllm serve $MODEL --port $PORT \
+python3 -m sglang.launch_server --model-path=$MODEL --trust-remote-code \
+--host=0.0.0.0 --port=$PORT \
 --tensor-parallel-size=$TP \
-$EP \
---gpu-memory-utilization 0.95 \
---max-model-len $MAX_MODEL_LEN \
---kv-cache-dtype fp8 \
---block-size=32 \
---no-enable-prefix-caching \
---attention-backend "ROCM_AITER_FA" \
---trust-remote-code > $SERVER_LOG 2>&1 &
+--attention-backend aiter \
+--mem-fraction-static $MEM_FRAC_STATIC \
+--model-loader-extra-config '{"enable_multithread_load": true}' \
+--watchdog-timeout 1200  \
+--disable-radix-cache \
+> $SERVER_LOG 2>&1 &
 
 SERVER_PID=$!
 
 # Wait for server to be ready
-wait_for_server_ready --port "$PORT" --server-log "$SERVER_LOG" --server-pid "$SERVER_PID"
+wait_for_server_ready --port "$PORT" --server-log "$SERVER_LOG" --server-pid "$SERVER_PID" --sleep-interval 60
 
 run_benchmark_serving \
     --model "$MODEL" \
@@ -71,8 +56,7 @@ run_benchmark_serving \
     --num-prompts "$((CONC * 10))" \
     --max-concurrency "$CONC" \
     --result-filename "$RESULT_FILENAME" \
-    --result-dir /workspace/ \
-    --trust-remote-code
+    --result-dir /workspace/
 
 # After throughput, run evaluation only if RUN_EVAL is true
 if [ "${RUN_EVAL}" = "true" ]; then

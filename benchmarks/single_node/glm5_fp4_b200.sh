@@ -5,61 +5,61 @@ source "$(dirname "$0")/../benchmark_lib.sh"
 check_env_vars \
     MODEL \
     TP \
-    EP_SIZE \
     CONC \
     ISL \
     OSL \
-    MAX_MODEL_LEN \
     RANDOM_RANGE_RATIO \
-    RESULT_FILENAME
+    RESULT_FILENAME \
+    EP_SIZE
 
 if [[ -n "$SLURM_JOB_ID" ]]; then
   echo "JOB $SLURM_JOB_ID running on $SLURMD_NODENAME"
 fi
 
+nvidia-smi
+
 hf download "$MODEL"
-
-# Set HIP_VISIBLE_DEVICES to match ROCR_VISIBLE_DEVICES for Ray compatibility in vLLM 0.14+
-if [ -n "$ROCR_VISIBLE_DEVICES" ]; then
-    export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"
-fi
-
-export VLLM_ROCM_USE_AITER=1
-export VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4
 
 SERVER_LOG=/workspace/server.log
 PORT=${PORT:-8888}
 
+echo "EP_SIZE: $EP_SIZE, CONC: $CONC, ISL: $ISL, OSL: $OSL"
+
+EVAL_CONTEXT_ARGS=""
 if [ "${EVAL_ONLY}" = "true" ]; then
     setup_eval_context
-    MAX_MODEL_LEN="$EVAL_MAX_MODEL_LEN"
+    EVAL_CONTEXT_ARGS="--context-length $EVAL_MAX_MODEL_LEN"
 fi
-
-if [ "$EP_SIZE" -gt 1 ]; then
-  EP=" --enable-expert-parallel"
-else
-  EP=" "
-fi
-
 # Start GPU monitoring (power, temperature, clocks every second)
 start_gpu_monitor
 
 set -x
-vllm serve $MODEL --port $PORT \
+PYTHONNOUSERSITE=1 python3 -m sglang.launch_server --model-path=$MODEL --host=0.0.0.0 --port=$PORT \
+--trust-remote-code \
 --tensor-parallel-size=$TP \
-$EP \
---gpu-memory-utilization 0.95 \
---max-model-len $MAX_MODEL_LEN \
---kv-cache-dtype fp8 \
---block-size=32 \
---no-enable-prefix-caching \
---attention-backend "ROCM_AITER_FA" \
---trust-remote-code > $SERVER_LOG 2>&1 &
+--data-parallel-size 1 --expert-parallel-size $EP_SIZE \
+--disable-radix-cache \
+--quantization modelopt_fp4 \
+--kv-cache-dtype fp8_e4m3 \
+--nsa-decode-backend trtllm \
+--nsa-prefill-backend trtllm \
+--moe-runner-backend flashinfer_trtllm \
+--enable-flashinfer-allreduce-fusion \
+--cuda-graph-max-bs 256 \
+--max-prefill-tokens 32768 \
+--chunked-prefill-size 32768 \
+--mem-fraction-static 0.9 \
+--stream-interval 30 \
+--scheduler-recv-interval 10 \
+--tokenizer-worker-num 6 \
+--tokenizer-path $MODEL $EVAL_CONTEXT_ARGS > $SERVER_LOG 2>&1 &
 
 SERVER_PID=$!
 
 # Wait for server to be ready
 wait_for_server_ready --port "$PORT" --server-log "$SERVER_LOG" --server-pid "$SERVER_PID"
+
+pip install -q datasets pandas
 
 run_benchmark_serving \
     --model "$MODEL" \
@@ -71,8 +71,7 @@ run_benchmark_serving \
     --num-prompts "$((CONC * 10))" \
     --max-concurrency "$CONC" \
     --result-filename "$RESULT_FILENAME" \
-    --result-dir /workspace/ \
-    --trust-remote-code
+    --result-dir /workspace/
 
 # After throughput, run evaluation only if RUN_EVAL is true
 if [ "${RUN_EVAL}" = "true" ]; then
