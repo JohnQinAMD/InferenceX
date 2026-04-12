@@ -1,2 +1,5 @@
 **/__pycache__/**
 **/.coverage
+
+# Local transformers module stubs (not part of InferenceX)
+/modules/
