@@ -2400,3 +2400,9 @@
   description:
     - "Update vLLM image from v0.18.0 to v0.20.2"
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1340
+
+- config-keys:
+    - qwen3.5-bf16-b300-sglang
+  description:
+    - "Update SGLang image from v0.5.10.post1-cu130 to v0.5.11-cu130"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1341
